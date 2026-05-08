@@ -11,13 +11,36 @@
 #ifndef ZLMEDIAKIT_JT1078PSDEMUXER_H
 #define ZLMEDIAKIT_JT1078PSDEMUXER_H
 
+#include "Extension/Frame.h"
+#include "Network/Buffer.h"
+
 #include <memory>
+#include <vector>
 
 namespace mediakit {
 
 class JT1078PsDemuxer {
 public:
     using Ptr = std::shared_ptr<JT1078PsDemuxer>;
+
+    struct Frame {
+        CodecId codec_id = CodecInvalid;
+        int stream = 0;
+        int flags = 0;
+        int64_t pts = 0;
+        int64_t dts = 0;
+        toolkit::Buffer::Ptr payload;
+    };
+
+    JT1078PsDemuxer();
+    ~JT1078PsDemuxer();
+
+    std::vector<Frame> input(const toolkit::Buffer::Ptr &ps);
+    void reset();
+
+private:
+    void *_ps_demuxer = nullptr;
+    std::vector<Frame> _frames;
 };
 
 } // namespace mediakit

@@ -11,15 +11,16 @@
 #ifndef ZLMEDIAKIT_JT1078SESSION_H
 #define ZLMEDIAKIT_JT1078SESSION_H
 
+#include "JT1078FrameAssembler.h"
+#include "JT1078PsDemuxer.h"
 #include "Network/Session.h"
 #include "Network/Buffer.h"
 #include "Util/TimeTicker.h"
 
 namespace mediakit {
 
-class JT1078RtpDecoder;
-class JT1078FrameAssembler;
-class JT1078PsDemuxer;
+struct JT1078RtpPacket;
+class JT1078PacketSplitter;
 class JT1078StreamMuxer;
 
 class JT1078Session : public toolkit::Session {
@@ -37,6 +38,11 @@ private:
     void onClose(const toolkit::SockException &err);
     void resetStreamContext();
     void logStep2State(const char *stage, size_t incoming = 0);
+    void onSplitterEvent(const char *stage, size_t consumed, const std::string &err);
+    void onRtpPacket(const JT1078RtpPacket &packet, size_t consumed);
+    void logStep3Packet(const char *stage, const JT1078RtpPacket *packet, size_t consumed, const std::string &err);
+    void logStep4Frame(const char *stage, const JT1078FrameAssembler::Result &result);
+    void logStep5Frame(const JT1078PsDemuxer::Frame &frame);
 
 private:
     std::string _sim;
@@ -44,10 +50,9 @@ private:
     std::string _stream_id;
 
     uint64_t _total_bytes = 0;
-    toolkit::BufferLikeString _recv_buffer;
     toolkit::Ticker _ticker;
 
-    std::shared_ptr<JT1078RtpDecoder> _rtp_decoder;
+    std::shared_ptr<JT1078PacketSplitter> _packet_splitter;
     std::shared_ptr<JT1078FrameAssembler> _frame_assembler;
     std::shared_ptr<JT1078PsDemuxer> _ps_demuxer;
     std::shared_ptr<JT1078StreamMuxer> _stream_muxer;
