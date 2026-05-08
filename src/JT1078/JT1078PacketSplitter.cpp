@@ -18,6 +18,7 @@ using namespace toolkit;
 namespace mediakit {
 
 static constexpr size_t kV4HeaderSize = 32;
+static constexpr size_t kLengthFieldSize = 2;
 
 void JT1078PacketSplitter::input(const char *data, size_t len) {
     if (!data || !len) {
@@ -29,50 +30,18 @@ void JT1078PacketSplitter::input(const char *data, size_t len) {
     }
     _cache.append(data, len);
 
-    while (_cache.size() >= kV4HeaderSize) {
-        if (!isV4PacketHeader(_cache.data(), _cache.size(), 0)) {
-            auto next = findV4PacketHeader(_cache.data(), _cache.size(), 1);
-            auto consumed = next >= 0 ? (size_t)next : 1;
-            emitEvent("invalid", consumed, "discard bytes before jt1078 v4 header");
-            _cache.erase(0, consumed);
+    while (_cache.size()) {
+        bool matched_length = false;
+        if (tryInputLengthPrefixedPacket(matched_length)) {
             continue;
-        }
-
-        auto next = findV4PacketHeader(_cache.data(), _cache.size(), 1);
-        if (next < 0) {
-            emitEvent("need_more", 0, "need next jt1078 v4 header to split tcp stream");
+        } else if (matched_length) {
             return;
         }
 
-        JT1078RtpPacket packet;
-        size_t consumed = (size_t)next;
-        std::string err;
-        auto result = _decoder.input(_cache.data(), consumed, packet, consumed, err);
-        switch (result) {
-            case JT1078RtpDecoder::DecodeResult::Parsed: {
-                if (_on_packet) {
-                    _on_packet(packet, consumed);
-                }
-                _cache.erase(0, consumed);
-                break;
-            }
-            case JT1078RtpDecoder::DecodeResult::NeedMore: {
-                emitEvent("need_more", consumed, err);
-                return;
-            }
-            case JT1078RtpDecoder::DecodeResult::Invalid: {
-                if (!consumed) {
-                    consumed = 1;
-                }
-                emitEvent("invalid", consumed, err);
-                _cache.erase(0, std::min(consumed, _cache.size()));
-                break;
-            }
+        if (tryInputScannedPacket()) {
+            continue;
         }
-    }
-
-    if (_cache.size()) {
-        emitEvent("need_more", 0, "need more bytes for jt1078 v4 header");
+        return;
     }
 }
 
@@ -86,17 +55,7 @@ void JT1078PacketSplitter::flush() {
         return;
     }
 
-    JT1078RtpPacket packet;
-    size_t consumed = _cache.size();
-    std::string err;
-    auto result = _decoder.input(_cache.data(), _cache.size(), packet, consumed, err);
-    if (result == JT1078RtpDecoder::DecodeResult::Parsed) {
-        if (_on_packet) {
-            _on_packet(packet, consumed);
-        }
-    } else {
-        emitEvent(result == JT1078RtpDecoder::DecodeResult::NeedMore ? "need_more" : "invalid", consumed, err);
-    }
+    inputPacket(_cache.data(), _cache.size(), _cache.size(), "flush");
     _cache.clear();
 }
 
@@ -118,6 +77,87 @@ void JT1078PacketSplitter::setOnPacket(onPacket cb) {
 
 void JT1078PacketSplitter::setOnEvent(onEvent cb) {
     _on_event = std::move(cb);
+}
+
+bool JT1078PacketSplitter::tryInputLengthPrefixedPacket(bool &matched) {
+    matched = false;
+    if (_cache.size() < kLengthFieldSize) {
+        emitEvent("need_more", 0, "need more bytes for jt1078 length field");
+        return false;
+    }
+
+    auto packet_size = loadBE16(_cache.data());
+    if (packet_size < kV4HeaderSize) {
+        return false;
+    }
+    if (!isV4PacketHeader(_cache.data() + kLengthFieldSize, _cache.size() - kLengthFieldSize, 0)) {
+        return false;
+    }
+
+    matched = true;
+    auto total_size = kLengthFieldSize + packet_size;
+    if (_cache.size() < total_size) {
+        emitEvent("need_more", 0, "need more bytes for jt1078 length-prefixed packet");
+        return false;
+    }
+    if (inputPacket(_cache.data() + kLengthFieldSize, packet_size, total_size, "len_prefixed")) {
+        _cache.erase(0, total_size);
+    }
+    return true;
+}
+
+bool JT1078PacketSplitter::tryInputScannedPacket() {
+    if (_cache.size() < kV4HeaderSize) {
+        emitEvent("need_more", 0, "need more bytes for jt1078 v4 header");
+        return false;
+    }
+    if (!isV4PacketHeader(_cache.data(), _cache.size(), 0)) {
+        auto next = findV4PacketHeader(_cache.data(), _cache.size(), 1);
+        auto consumed = next >= 0 ? (size_t)next : 1;
+        emitEvent("invalid", consumed, "discard bytes before jt1078 v4 header");
+        _cache.erase(0, consumed);
+        return true;
+    }
+
+    auto next = findV4PacketHeader(_cache.data(), _cache.size(), 1);
+    if (next < 0) {
+        emitEvent("need_more", 0, "need next jt1078 v4 header to split tcp stream");
+        return false;
+    }
+    if (inputPacket(_cache.data(), (size_t)next, (size_t)next, "scanned")) {
+        _cache.erase(0, (size_t)next);
+    }
+    return true;
+}
+
+bool JT1078PacketSplitter::inputPacket(const char *data, size_t len, size_t consumed, const char *stage) {
+    JT1078RtpPacket packet;
+    size_t packet_consumed = len;
+    std::string err;
+    auto result = _decoder.input(data, len, packet, packet_consumed, err);
+    switch (result) {
+        case JT1078RtpDecoder::DecodeResult::Parsed: {
+            emitEvent(stage, consumed, "");
+            if (_on_packet) {
+                _on_packet(packet, consumed);
+            }
+            return true;
+        }
+        case JT1078RtpDecoder::DecodeResult::NeedMore: {
+            emitEvent("need_more", consumed, err);
+            return false;
+        }
+        case JT1078RtpDecoder::DecodeResult::Invalid: {
+            emitEvent("invalid", consumed, err);
+            return true;
+        }
+    }
+    return true;
+}
+
+uint16_t JT1078PacketSplitter::loadBE16(const char *data) const {
+    auto ptr = reinterpret_cast<const uint8_t *>(data);
+    return (uint16_t(ptr[0]) << 8) | ptr[1];
 }
 
 bool JT1078PacketSplitter::isV4PacketHeader(const char *data, size_t len, size_t offset) const {
