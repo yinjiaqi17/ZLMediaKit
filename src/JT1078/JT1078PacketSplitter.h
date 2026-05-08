@@ -36,6 +36,10 @@ public:
     void setOnEvent(onEvent cb);
 
 private:
+    bool tryInputLengthPrefixedPacket(bool &matched);
+    bool tryInputScannedPacket();
+    bool inputPacket(const char *data, size_t len, size_t consumed, const char *stage);
+    uint16_t loadBE16(const char *data) const;
     bool isV4PacketHeader(const char *data, size_t len, size_t offset) const;
     ssize_t findV4PacketHeader(const char *data, size_t len, size_t offset) const;
     bool isBcdSim(const uint8_t *data) const;
