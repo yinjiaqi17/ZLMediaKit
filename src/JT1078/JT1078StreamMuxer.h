@@ -25,7 +25,7 @@ public:
     using Ptr = std::shared_ptr<JT1078StreamMuxer>;
 
     bool start(const std::string &stream_id);
-    bool inputFrame(const JT1078PsDemuxer::Frame &frame);
+    bool inputFrame(const JT1078PsDemuxer::Frame &frame, uint64_t fallback_timestamp);
     void reset();
 
     bool started() const;
@@ -33,12 +33,16 @@ public:
 
 private:
     bool addTrackIfNeed(const JT1078PsDemuxer::Frame &frame);
+    int getTrackIndex(const JT1078PsDemuxer::Frame &frame) const;
+    uint64_t normalizeStamp(uint64_t demux_stamp, uint64_t fallback_timestamp, uint64_t &last_stamp, const char *&stamp_source);
 
 private:
     std::string _stream_id;
     MultiMediaSourceMuxer::Ptr _muxer;
     std::unordered_set<int> _track_added;
     bool _track_completed = false;
+    uint64_t _last_dts = 0;
+    uint64_t _last_pts = 0;
 };
 
 } // namespace mediakit

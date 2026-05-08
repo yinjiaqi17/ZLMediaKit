@@ -169,7 +169,7 @@ void JT1078Session::onRtpPacket(const JT1078RtpPacket &packet, size_t consumed) 
                         << ", payload_size: " << (frame.payload ? frame.payload->size() : 0);
             continue;
         }
-        _stream_muxer->inputFrame(frame);
+        _stream_muxer->inputFrame(frame, assemble_result.timestamp);
     }
 }
 
