@@ -24,6 +24,7 @@
 #include "Shell/ShellSession.h"
 #include "Http/WebSocketSession.h"
 #include "Rtp/RtpServer.h"
+#include "JT1078/JT1078TcpServer.h"
 #include "WebApi.h"
 #include "WebHook.h"
 
@@ -110,6 +111,23 @@ onceToken token1([](){
     mINI::Instance()[kPort] = 10000;
 });
 } //namespace RtpProxy
+
+// //////////JT1078服务器配置///////////
+namespace JT1078 {
+#define JT1078_FIELD "jt1078."
+const string kEnable = JT1078_FIELD"enable";
+const string kPort = JT1078_FIELD"port";
+const string kTransport = JT1078_FIELD"transport";
+const string kTimeoutSec = JT1078_FIELD"timeoutSec";
+const string kWaitIFrame = JT1078_FIELD"waitIFrame";
+onceToken token1([](){
+    mINI::Instance()[kEnable] = 1;
+    mINI::Instance()[kPort] = 1078;
+    mINI::Instance()[kTransport] = "tcp";
+    mINI::Instance()[kTimeoutSec] = 30;
+    mINI::Instance()[kWaitIFrame] = 1;
+});
+} //namespace JT1078
 
 namespace Python {
 #define Python_FIELD "python."
@@ -338,6 +356,8 @@ int start_main(int argc,char *argv[]) {
         uint16_t httpPort = mINI::Instance()[Http::kPort];
         uint16_t httpsPort = mINI::Instance()[Http::kSSLPort];
         uint16_t rtpPort = mINI::Instance()[RtpProxy::kPort];
+        bool jt1078Enable = mINI::Instance()[JT1078::kEnable];
+        uint16_t jt1078Port = mINI::Instance()[JT1078::kPort];
 
         // 简单的telnet服务器，可用于服务器调试，但是不能使用23端口，否则telnet上了莫名其妙的现象  [AUTO-TRANSLATED:f9324c6e]
         // Simple telnet server, can be used for server debugging, but cannot use port 23, otherwise telnet will have inexplicable phenomena
@@ -365,6 +385,8 @@ int start_main(int argc,char *argv[]) {
         // GB28181 rtp push stream port, supports UDP/TCP
         auto rtpServer = std::make_shared<RtpServer>();
 #endif//defined(ENABLE_RTPPROXY)
+
+        auto jt1078TcpServer = std::make_shared<JT1078TcpServer>();
 
 #if defined(ENABLE_WEBRTC)
         auto rtcSrv_tcp = std::make_shared<TcpServer>();
@@ -451,6 +473,9 @@ int start_main(int argc,char *argv[]) {
             // create rtp server
             if (rtpPort) { rtpServer->start(rtpPort, listen_ip.c_str()); }
 #endif//defined(ENABLE_RTPPROXY)
+
+            // JT1078 TCP接入服务器
+            if (jt1078Enable && jt1078Port) { jt1078TcpServer->start(jt1078Port, listen_ip); }
 
 #if defined(ENABLE_WEBRTC)
             // webrtc udp服务器  [AUTO-TRANSLATED:157a64e5]
@@ -539,5 +564,3 @@ int main(int argc,char *argv[]) {
     return start_main(argc,argv);
 }
 #endif //DISABLE_MAIN
-
-
