@@ -15,6 +15,128 @@
 using namespace toolkit;
 
 namespace mediakit {
+namespace {
+
+struct H264NalSummary {
+    int first_type = -1;
+    size_t nal_count = 0;
+    size_t sps = 0;
+    size_t pps = 0;
+    size_t idr = 0;
+    size_t slice = 0;
+    size_t sei = 0;
+    size_t aud = 0;
+};
+
+struct H264NalPart {
+    size_t offset = 0;
+    size_t size = 0;
+    size_t prefix_size = 0;
+    int type = -1;
+};
+
+size_t findStartCode(const char *data, size_t size, size_t pos, size_t &prefix_size) {
+    while (pos + 3 <= size) {
+        if (pos + 4 <= size && data[pos] == 0x00 && data[pos + 1] == 0x00 && data[pos + 2] == 0x00 && data[pos + 3] == 0x01) {
+            prefix_size = 4;
+            return pos;
+        }
+        if (data[pos] == 0x00 && data[pos + 1] == 0x00 && data[pos + 2] == 0x01) {
+            prefix_size = 3;
+            return pos;
+        }
+        ++pos;
+    }
+    return size;
+}
+
+H264NalSummary getH264NalSummary(const toolkit::Buffer::Ptr &payload) {
+    H264NalSummary summary;
+    if (!payload || payload->size() == 0) {
+        return summary;
+    }
+
+    auto data = payload->data();
+    auto size = payload->size();
+    size_t prefix_size = 0;
+    auto start = findStartCode(data, size, 0, prefix_size);
+    if (start == size) {
+        summary.nal_count = 1;
+        summary.first_type = static_cast<uint8_t>(data[0]) & 0x1F;
+        switch (summary.first_type) {
+            case 1: ++summary.slice; break;
+            case 5: ++summary.idr; break;
+            case 6: ++summary.sei; break;
+            case 7: ++summary.sps; break;
+            case 8: ++summary.pps; break;
+            case 9: ++summary.aud; break;
+            default: break;
+        }
+        return summary;
+    }
+
+    while (start < size) {
+        auto nal_pos = start + prefix_size;
+        if (nal_pos >= size) {
+            break;
+        }
+        auto type = static_cast<uint8_t>(data[nal_pos]) & 0x1F;
+        if (summary.first_type < 0) {
+            summary.first_type = type;
+        }
+        ++summary.nal_count;
+        switch (type) {
+            case 1: ++summary.slice; break;
+            case 5: ++summary.idr; break;
+            case 6: ++summary.sei; break;
+            case 7: ++summary.sps; break;
+            case 8: ++summary.pps; break;
+            case 9: ++summary.aud; break;
+            default: break;
+        }
+        start = findStartCode(data, size, nal_pos + 1, prefix_size);
+    }
+    return summary;
+}
+
+template <typename FUNC>
+size_t forEachAnnexBNal(const toolkit::Buffer::Ptr &payload, FUNC &&func) {
+    if (!payload || payload->size() == 0) {
+        return 0;
+    }
+
+    auto data = payload->data();
+    auto size = payload->size();
+    size_t prefix_size = 0;
+    auto start = findStartCode(data, size, 0, prefix_size);
+    if (start == size) {
+        return 0;
+    }
+
+    size_t count = 0;
+    while (start < size) {
+        auto nal_pos = start + prefix_size;
+        if (nal_pos >= size) {
+            break;
+        }
+        size_t next_prefix = 0;
+        auto next = findStartCode(data, size, nal_pos + 1, next_prefix);
+        H264NalPart part;
+        part.offset = start;
+        part.size = (next == size ? size : next) - start;
+        part.prefix_size = prefix_size;
+        part.type = static_cast<uint8_t>(data[nal_pos]) & 0x1F;
+        if (part.size > part.prefix_size) {
+            func(part);
+            ++count;
+        }
+        start = next;
+        prefix_size = next_prefix;
+    }
+    return count;
+}
+
+} // namespace
 
 bool JT1078StreamMuxer::start(const std::string &stream_id) {
     if (stream_id.empty()) {
@@ -56,15 +178,19 @@ bool JT1078StreamMuxer::inputFrame(const JT1078PsDemuxer::Frame &frame, uint64_t
     }
     auto track_index = getTrackIndex(frame);
 
-    const char *dts_source = "demux";
-    const char *pts_source = "demux";
+    auto rtp_stamp = fallback_timestamp / 90;
+    const auto prefer_rtp_stamp = frame.codec_id == CodecH264 || frame.codec_id == CodecH265;
+    const char *dts_source = prefer_rtp_stamp ? "rtp" : "demux";
+    const char *pts_source = prefer_rtp_stamp ? "rtp" : "demux";
     auto demux_pts = frame.pts > 0 ? uint64_t(frame.pts / 90) : 0;
     auto demux_dts = frame.dts > 0 ? uint64_t(frame.dts / 90) : demux_pts;
-    if (!frame.dts && demux_dts) {
+    if (!prefer_rtp_stamp && !frame.dts && demux_dts) {
         dts_source = "demux_pts";
     }
-    auto dts = normalizeStamp(demux_dts, fallback_timestamp, _last_dts, dts_source);
-    auto pts = normalizeStamp(demux_pts ? demux_pts : dts, fallback_timestamp, _last_pts, pts_source);
+    auto dts_input = prefer_rtp_stamp ? rtp_stamp : demux_dts;
+    auto pts_input = prefer_rtp_stamp ? rtp_stamp : (demux_pts ? demux_pts : demux_dts);
+    auto dts = normalizeStamp(dts_input, fallback_timestamp, _last_dts, dts_source);
+    auto pts = normalizeStamp(pts_input ? pts_input : dts, fallback_timestamp, _last_pts, pts_source);
     if (pts < dts) {
         pts = dts;
         _last_pts = pts;
@@ -78,17 +204,96 @@ bool JT1078StreamMuxer::inputFrame(const JT1078PsDemuxer::Frame &frame, uint64_t
         return false;
     }
     zlm_frame->setIndex(track_index);
+    H264NalSummary h264_summary;
+    if (frame.codec_id == CodecH264) {
+        h264_summary = getH264NalSummary(frame.payload);
+        InfoL << "JT1078 step6 h264_nal"
+              << ", stream_id: " << _stream_id
+              << ", first_nal: " << h264_summary.first_type
+              << ", nal_count: " << h264_summary.nal_count
+              << ", sps: " << h264_summary.sps
+              << ", pps: " << h264_summary.pps
+              << ", idr: " << h264_summary.idr
+              << ", slice: " << h264_summary.slice
+              << ", sei: " << h264_summary.sei
+              << ", aud: " << h264_summary.aud
+              << ", zlm_prefix: " << zlm_frame->prefixSize()
+              << ", zlm_key: " << zlm_frame->keyFrame()
+              << ", zlm_config: " << zlm_frame->configFrame()
+              << ", zlm_decode_able: " << zlm_frame->decodeAble()
+              << ", dts: " << dts
+              << ", pts: " << pts
+              << ", payload_size: " << frame.payload->size();
+    }
+    if (frame.codec_id == CodecH264 && h264_summary.nal_count > 1 && (h264_summary.sps || h264_summary.pps) && (h264_summary.idr || h264_summary.slice)) {
+        bool any_ret = false;
+        size_t split_count = 0;
+        auto data = frame.payload->data();
+        forEachAnnexBNal(frame.payload, [&](const H264NalPart &part) {
+            auto sub_payload = std::make_shared<BufferString>(std::string(data + part.offset, part.size));
+            auto sub_frame = Factory::getFrameFromBuffer(frame.codec_id, sub_payload, dts, pts);
+            if (!sub_frame) {
+                WarnL << "JT1078 step6 h264_split_failed"
+                      << ", stream_id: " << _stream_id
+                      << ", nal_type: " << part.type
+                      << ", nal_size: " << part.size;
+                return;
+            }
+            sub_frame->setIndex(track_index);
+            auto ret = _muxer->inputFrame(sub_frame);
+            any_ret = any_ret || ret;
+            ++split_count;
+            InfoL << "JT1078 step6 h264_split_input"
+                  << ", stream_id: " << _stream_id
+                  << ", index: " << split_count
+                  << ", nal_type: " << part.type
+                  << ", nal_size: " << part.size
+                  << ", prefix: " << part.prefix_size
+                  << ", zlm_prefix: " << sub_frame->prefixSize()
+                  << ", zlm_key: " << sub_frame->keyFrame()
+                  << ", zlm_config: " << sub_frame->configFrame()
+                  << ", zlm_decode_able: " << sub_frame->decodeAble()
+                  << ", dts: " << dts
+                  << ", pts: " << pts
+                  << ", ret: " << ret;
+        });
+        InfoL << "JT1078 step6 frame_input"
+              << ", stream_id: " << _stream_id
+              << ", codec: " << getCodecName(frame.codec_id)
+              << ", ps_stream: " << frame.stream
+              << ", track: " << track_index
+              << ", raw_pts: " << frame.pts
+              << ", raw_dts: " << frame.dts
+              << ", demux_pts: " << demux_pts
+              << ", demux_dts: " << demux_dts
+              << ", rtp_stamp: " << rtp_stamp
+              << ", dts: " << dts
+              << ", pts: " << pts
+              << ", dts_source: " << dts_source
+              << ", pts_source: " << pts_source
+              << ", payload_size: " << frame.payload->size()
+              << ", split: 1"
+              << ", split_count: " << split_count
+              << ", ret: " << any_ret;
+        return any_ret;
+    }
     auto ret = _muxer->inputFrame(zlm_frame);
     InfoL << "JT1078 step6 frame_input"
           << ", stream_id: " << _stream_id
           << ", codec: " << getCodecName(frame.codec_id)
           << ", ps_stream: " << frame.stream
           << ", track: " << track_index
+          << ", raw_pts: " << frame.pts
+          << ", raw_dts: " << frame.dts
+          << ", demux_pts: " << demux_pts
+          << ", demux_dts: " << demux_dts
+          << ", rtp_stamp: " << rtp_stamp
           << ", dts: " << dts
           << ", pts: " << pts
           << ", dts_source: " << dts_source
           << ", pts_source: " << pts_source
           << ", payload_size: " << frame.payload->size()
+          << ", split: 0"
           << ", ret: " << ret;
     return ret;
 }
@@ -160,8 +365,14 @@ uint64_t JT1078StreamMuxer::normalizeStamp(uint64_t demux_stamp, uint64_t fallba
         stamp_source = "rtp";
     }
     if (last_stamp && stamp < last_stamp) {
-        stamp = last_stamp + 1;
-        stamp_source = "monotonic";
+        auto rtp_stamp = fallback_timestamp / 90;
+        if (rtp_stamp > last_stamp) {
+            stamp = rtp_stamp;
+            stamp_source = "rtp_monotonic";
+        } else {
+            stamp = last_stamp + 1;
+            stamp_source = "monotonic";
+        }
     }
     last_stamp = stamp;
     return stamp;

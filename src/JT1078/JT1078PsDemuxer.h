@@ -41,6 +41,8 @@ public:
 private:
     void *_ps_demuxer = nullptr;
     std::vector<Frame> _frames;
+    uint64_t _input_count = 0;
+    uint64_t _decode_count = 0;
 };
 
 } // namespace mediakit
