@@ -23,11 +23,13 @@ class JT1078StreamMuxer {
 public:
     using Ptr = std::shared_ptr<JT1078StreamMuxer>;
 
+    bool start(const std::string &app, const std::string &stream_id);
     bool start(const std::string &stream_id);
     bool inputFrame(const JT1078PsDemuxer::Frame &frame, uint64_t fallback_timestamp);
     void reset();
 
     bool started() const;
+    const std::string &app() const;
     const std::string &streamId() const;
 
 private:
@@ -43,6 +45,7 @@ private:
     void clearH264AccessUnit();
 
 private:
+    std::string _app;
     std::string _stream_id;
     MultiMediaSourceMuxer::Ptr _muxer;
     std::unordered_set<int> _track_added;

@@ -152,18 +152,29 @@ size_t forEachAnnexBNal(const toolkit::Buffer::Ptr &payload, FUNC &&func) {
 } // namespace
 
 bool JT1078StreamMuxer::start(const std::string &stream_id) {
-    if (stream_id.empty()) {
-        WarnL << "JT1078 step6 start muxer failed, empty stream id";
+    return start("jt1078", stream_id);
+}
+
+bool JT1078StreamMuxer::start(const std::string &app, const std::string &stream_id) {
+    if (app.empty()) {
+        WarnL << "JT1078 step6 start muxer failed, empty app"
+              << ", stream_id: " << (stream_id.empty() ? "-" : stream_id);
         return false;
     }
-    if (_muxer && _stream_id == stream_id) {
+    if (stream_id.empty()) {
+        WarnL << "JT1078 step6 start muxer failed, empty stream id"
+              << ", app: " << app;
+        return false;
+    }
+    if (_muxer && _app == app && _stream_id == stream_id) {
         return true;
     }
 
     reset();
+    _app = app;
     _stream_id = stream_id;
     ProtocolOption option;
-    MediaTuple tuple{DEFAULT_VHOST, "jt1078", _stream_id, ""};
+    MediaTuple tuple{DEFAULT_VHOST, _app, _stream_id, ""};
     _muxer = std::make_shared<MultiMediaSourceMuxer>(tuple, 0.0f, option);
     InfoL << "JT1078 step6 muxer_started"
           << ", app: " << tuple.app
@@ -506,9 +517,11 @@ void JT1078StreamMuxer::reset() {
 
     if (_muxer) {
         InfoL << "JT1078 step6 muxer_reset"
+              << ", app: " << (_app.empty() ? "-" : _app)
               << ", stream_id: " << (_stream_id.empty() ? "-" : _stream_id);
     }
     _muxer.reset();
+    _app.clear();
     _stream_id.clear();
     _track_added.clear();
     _track_completed = false;
@@ -521,6 +534,10 @@ void JT1078StreamMuxer::reset() {
 
 bool JT1078StreamMuxer::started() const {
     return static_cast<bool>(_muxer);
+}
+
+const std::string &JT1078StreamMuxer::app() const {
+    return _app;
 }
 
 const std::string &JT1078StreamMuxer::streamId() const {

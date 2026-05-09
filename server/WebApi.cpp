@@ -48,6 +48,9 @@
 #include "Pusher/PusherProxy.h"
 #include "Rtp/RtpProcess.h"
 #include "Record/MP4Reader.h"
+#include "JT1078/JT1078Session.h"
+#include "JT1078/JT1078SessionManager.h"
+#include "JT1078/JT1078TaskManager.h"
 
 #if defined(ENABLE_RTPPROXY)
 #include "Rtp/RtpServer.h"
@@ -784,6 +787,45 @@ template void check_secret<ApiArgsType>(toolkit::SockInfo &, mediakit::HttpSessi
 template void check_secret<Json::Value>(toolkit::SockInfo &, mediakit::HttpSession::KeyValue &, const HttpAllArgs<Json::Value> &, Json::Value &);
 template void check_secret<std::string>(toolkit::SockInfo &, mediakit::HttpSession::KeyValue &, const HttpAllArgs<std::string> &, Json::Value &);
 
+static Json::Value makeJT1078TaskJson(const JT1078Task &task) {
+    Json::Value item;
+    item["bizType"] = JT1078TaskManager::bizTypeToString(task.biz_type);
+    item["sim"] = task.sim;
+    item["channel"] = task.channel;
+    item["app"] = task.app;
+    item["streamId"] = task.stream_id;
+    item["taskId"] = task.task_id;
+    item["createMs"] = Json::UInt64(task.create_ms);
+    item["expireMs"] = Json::UInt64(task.expire_ms);
+    return item;
+}
+
+static std::string makeJT1078TaskId(const std::string &prefix) {
+    return prefix + "_" + std::to_string(getCurrentMillisecond(true));
+}
+
+static void preemptJT1078SessionIfNeed(const std::string &sim,
+                                       int channel,
+                                       const std::string &app,
+                                       const std::string &stream_id,
+                                       Json::Value &val) {
+    val["preempted"] = false;
+
+    auto active = JT1078SessionManager::Instance().findSessionByDevice(sim, channel);
+    if (!active || (active->app() == app && active->streamId() == stream_id)) {
+        return;
+    }
+
+    val["preempted"] = true;
+    val["closedApp"] = active->app();
+    val["closedStreamId"] = active->streamId();
+
+    std::string reason = StrPrinter << "JT1078 preempted by " << app << "/" << stream_id;
+    active->getPoller()->async([active, reason]() {
+        active->closeByBiz(reason);
+    });
+}
+
 /**
  * 安装api接口
  * 所有api都支持GET和POST两种方式
@@ -886,6 +928,135 @@ void installWebApi() {
     // Test url http://127.0.0.1/index/api/getApiList
     api_regist("/index/api/getApiList",[](API_ARGS_MAP){
         s_get_api_list(API_ARGS_VALUE);
+    });
+
+    api_regist("/index/api/jt1078/createLiveTask", [](API_ARGS_MAP) {
+        CHECK_SECRET();
+        CHECK_ARGS("sim", "channel");
+
+        std::string sim = allArgs["sim"];
+        int channel = allArgs["channel"].as<int>();
+        std::string task_id = allArgs["taskId"];
+        std::string app = allArgs["app"];
+        std::string stream_id = allArgs["streamId"];
+        int expire_sec = allArgs["expireSec"].empty() ? 30 : allArgs["expireSec"].as<int>();
+
+        if (channel <= 0) {
+            throw InvalidArgsException("channel must be positive");
+        }
+        if (task_id.empty()) {
+            task_id = makeJT1078TaskId("live");
+        }
+        if (app.empty()) {
+            app = "live";
+        }
+        if (stream_id.empty()) {
+            stream_id = sim + "_" + std::to_string(channel) + "_live";
+        }
+        if (expire_sec <= 0) {
+            expire_sec = 30;
+        }
+
+        preemptJT1078SessionIfNeed(sim, channel, app, stream_id, val);
+
+        JT1078Task task;
+        task.biz_type = JT1078BizType::Live;
+        task.sim = sim;
+        task.channel = channel;
+        task.app = app;
+        task.stream_id = stream_id;
+        task.task_id = task_id;
+        task.create_ms = getCurrentMillisecond();
+        task.expire_ms = task.create_ms + uint64_t(expire_sec) * 1000;
+        if (!JT1078TaskManager::Instance().addPendingTask(task)) {
+            throw ApiRetException("create live task failed", API::OtherFailed);
+        }
+
+        val["data"] = makeJT1078TaskJson(task);
+    });
+
+    api_regist("/index/api/jt1078/createPlaybackTask", [](API_ARGS_MAP) {
+        CHECK_SECRET();
+        CHECK_ARGS("sim", "channel", "taskId");
+
+        std::string sim = allArgs["sim"];
+        int channel = allArgs["channel"].as<int>();
+        std::string task_id = allArgs["taskId"];
+        std::string app = allArgs["app"];
+        std::string stream_id = allArgs["streamId"];
+        int expire_sec = allArgs["expireSec"].empty() ? 30 : allArgs["expireSec"].as<int>();
+
+        if (channel <= 0) {
+            throw InvalidArgsException("channel must be positive");
+        }
+        if (app.empty()) {
+            app = "playback";
+        }
+        if (stream_id.empty()) {
+            stream_id = sim + "_" + std::to_string(channel) + "_replay_" + task_id;
+        }
+        if (expire_sec <= 0) {
+            expire_sec = 30;
+        }
+
+        preemptJT1078SessionIfNeed(sim, channel, app, stream_id, val);
+
+        JT1078Task task;
+        task.biz_type = JT1078BizType::Playback;
+        task.sim = sim;
+        task.channel = channel;
+        task.app = app;
+        task.stream_id = stream_id;
+        task.task_id = task_id;
+        task.create_ms = getCurrentMillisecond();
+        task.expire_ms = task.create_ms + uint64_t(expire_sec) * 1000;
+        if (!JT1078TaskManager::Instance().addPendingTask(task)) {
+            throw ApiRetException("create playback task failed", API::OtherFailed);
+        }
+
+        val["data"] = makeJT1078TaskJson(task);
+    });
+
+    api_regist("/index/api/jt1078/getPendingTaskList", [](API_ARGS_MAP) {
+        CHECK_SECRET();
+
+        Json::Value data(Json::arrayValue);
+        auto tasks = JT1078TaskManager::Instance().listPendingTasks();
+        for (auto &task : tasks) {
+            data.append(makeJT1078TaskJson(task));
+        }
+        val["data"] = data;
+        val["count"] = (int)tasks.size();
+    });
+
+    api_regist("/index/api/jt1078/closeStream", [](API_ARGS_MAP) {
+        CHECK_SECRET();
+        CHECK_ARGS("app");
+
+        std::string app = allArgs["app"];
+        std::string stream_id = allArgs["streamId"];
+        if (stream_id.empty()) {
+            stream_id = allArgs["stream"];
+        }
+        if (stream_id.empty()) {
+            throw InvalidArgsException("Required parameter missed: streamId");
+        }
+
+        auto removed_pending = JT1078TaskManager::Instance().removePendingTaskByStream(app, stream_id);
+        auto session = JT1078SessionManager::Instance().findSession(app, stream_id);
+        if (session) {
+            std::string reason = StrPrinter << "JT1078 close stream by api, app=" << app << ", stream_id=" << stream_id;
+            session->getPoller()->async([session, reason]() {
+                session->closeByBiz(reason);
+            });
+        } else {
+            InfoL << "JT1078 close stream, active session not found"
+                  << ", app: " << app
+                  << ", stream_id: " << stream_id;
+        }
+
+        val["removedPendingTask"] = removed_pending;
+        val["closedActiveSession"] = !!session;
     });
 
     // 获取服务器api列表  [AUTO-TRANSLATED:e4c0dd9d]

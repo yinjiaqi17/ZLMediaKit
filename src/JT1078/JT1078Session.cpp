@@ -13,7 +13,9 @@
 #include "JT1078PacketSplitter.h"
 #include "JT1078PsDemuxer.h"
 #include "JT1078RtpDecoder.h"
+#include "JT1078SessionManager.h"
 #include "JT1078StreamMuxer.h"
+#include "JT1078TaskManager.h"
 #include "Common/config.h"
 
 using namespace toolkit;
@@ -55,6 +57,33 @@ void JT1078Session::onManager() {
     }
 }
 
+void JT1078Session::closeByBiz(const std::string &reason) {
+    WarnP(this) << "JT1078 session close by biz"
+                << ", reason: " << (reason.empty() ? "-" : reason)
+                << ", app: " << (_context.app.empty() ? "-" : _context.app)
+                << ", stream_id: " << (_context.stream_id.empty() ? "-" : _context.stream_id)
+                << ", sim: " << (_context.sim.empty() ? "-" : _context.sim)
+                << ", channel: " << _context.channel
+                << ", task_id: " << (_context.task_id.empty() ? "-" : _context.task_id);
+    shutdown(SockException(Err_shutdown, reason.empty() ? "JT1078 session closed by biz" : reason));
+}
+
+const std::string &JT1078Session::app() const {
+    return _context.app;
+}
+
+const std::string &JT1078Session::streamId() const {
+    return _context.stream_id;
+}
+
+const std::string &JT1078Session::sim() const {
+    return _context.sim;
+}
+
+int JT1078Session::channel() const {
+    return _context.channel;
+}
+
 void JT1078Session::onInputData(const char *data, size_t len) {
     if (!data || !len) {
         logStep2State("empty_input", len);
@@ -85,9 +114,11 @@ void JT1078Session::onClose(const SockException &err) {
 }
 
 void JT1078Session::resetStreamContext() {
-    _sim.clear();
-    _channel = 0;
-    _stream_id.clear();
+    if (_context.registered) {
+        JT1078SessionManager::Instance().removeSession(_context.app, _context.stream_id, _context.sim, _context.channel);
+        _context.registered = false;
+    }
+    _context = JT1078SessionContext();
     if (_packet_splitter) {
         _packet_splitter->reset();
     }
@@ -101,9 +132,13 @@ void JT1078Session::resetStreamContext() {
 void JT1078Session::logStep2State(const char *stage, size_t incoming) {
     InfoP(this) << "JT1078 step2 " << stage
                 << ", peer: " << get_peer_ip() << ":" << get_peer_port()
-                << ", sim: " << (_sim.empty() ? "-" : _sim)
-                << ", channel: " << _channel
-                << ", stream_id: " << (_stream_id.empty() ? "-" : _stream_id)
+                << ", biz_type: " << JT1078TaskManager::bizTypeToString(_context.biz_type)
+                << ", app: " << (_context.app.empty() ? "-" : _context.app)
+                << ", sim: " << (_context.sim.empty() ? "-" : _context.sim)
+                << ", channel: " << _context.channel
+                << ", stream_id: " << (_context.stream_id.empty() ? "-" : _context.stream_id)
+                << ", task_id: " << (_context.task_id.empty() ? "-" : _context.task_id)
+                << ", bound: " << _context.bound
                 << ", incoming: " << incoming
                 << ", cached: " << (_packet_splitter ? _packet_splitter->cachedSize() : 0)
                 << ", total: " << _total_bytes
@@ -120,20 +155,16 @@ void JT1078Session::onSplitterEvent(const char *stage, size_t consumed, const st
 void JT1078Session::onRtpPacket(const JT1078RtpPacket &packet, size_t consumed) {
     logStep3Packet("parsed", &packet, consumed, "");
 
-    if (_sim.empty()) {
-        _sim = packet.sim;
-    }
-    if (!_channel) {
-        _channel = packet.channel;
-    }
-    if (_stream_id.empty() && !_sim.empty() && _channel) {
-        _stream_id = _sim + "_" + std::to_string(_channel) + "_live";
+    if (!_context.bound) {
+        bindSession(packet.sim, packet.channel);
     }
 
     InfoP(this) << "JT1078 step3 rtp_ready"
-                << ", stream_id: " << (_stream_id.empty() ? "-" : _stream_id)
-                << ", sim: " << (_sim.empty() ? "-" : _sim)
-                << ", channel: " << _channel
+                << ", biz_type: " << JT1078TaskManager::bizTypeToString(_context.biz_type)
+                << ", app: " << (_context.app.empty() ? "-" : _context.app)
+                << ", stream_id: " << (_context.stream_id.empty() ? "-" : _context.stream_id)
+                << ", sim: " << (_context.sim.empty() ? "-" : _context.sim)
+                << ", channel: " << _context.channel
                 << ", data_type: " << (int)packet.data_type << "(" << JT1078RtpDecoder::dataTypeToString(packet.data_type) << ")"
                 << ", packet_type: " << (int)packet.packet_type << "(" << JT1078RtpDecoder::packetTypeToString(packet.packet_type) << ")"
                 << ", seq: " << packet.sequence
@@ -141,7 +172,7 @@ void JT1078Session::onRtpPacket(const JT1078RtpPacket &packet, size_t consumed) 
                 << ", payload_size: " << packet.payload_size;
 
     if (!_frame_assembler) {
-        WarnP(this) << "JT1078 step4 assembler_null, stream_id: " << (_stream_id.empty() ? "-" : _stream_id);
+        WarnP(this) << "JT1078 step4 assembler_null, stream_id: " << (_context.stream_id.empty() ? "-" : _context.stream_id);
         return;
     }
     auto assemble_result = _frame_assembler->input(packet);
@@ -151,25 +182,68 @@ void JT1078Session::onRtpPacket(const JT1078RtpPacket &packet, size_t consumed) 
     }
 
     if (!_ps_demuxer) {
-        WarnP(this) << "JT1078 step5 demuxer_null, stream_id: " << (_stream_id.empty() ? "-" : _stream_id)
+        WarnP(this) << "JT1078 step5 demuxer_null, stream_id: " << (_context.stream_id.empty() ? "-" : _context.stream_id)
                     << ", ps_size: " << assemble_result.frame->size();
         return;
     }
     auto frames = _ps_demuxer->input(assemble_result.frame);
     InfoP(this) << "JT1078 step5 ps_demuxed"
-                << ", stream_id: " << (_stream_id.empty() ? "-" : _stream_id)
+                << ", app: " << (_context.app.empty() ? "-" : _context.app)
+                << ", stream_id: " << (_context.stream_id.empty() ? "-" : _context.stream_id)
                 << ", ps_size: " << assemble_result.frame->size()
                 << ", frame_count: " << frames.size();
     for (auto &frame : frames) {
         logStep5Frame(frame);
-        if (!_stream_muxer || !_stream_muxer->start(_stream_id)) {
+        if (!_stream_muxer || !_stream_muxer->start(_context.app, _context.stream_id)) {
             WarnP(this) << "JT1078 step6 muxer_unavailable"
-                        << ", stream_id: " << (_stream_id.empty() ? "-" : _stream_id)
+                        << ", app: " << (_context.app.empty() ? "-" : _context.app)
+                        << ", stream_id: " << (_context.stream_id.empty() ? "-" : _context.stream_id)
                         << ", codec: " << getCodecName(frame.codec_id)
                         << ", payload_size: " << (frame.payload ? frame.payload->size() : 0);
             continue;
         }
         _stream_muxer->inputFrame(frame, assemble_result.timestamp);
+    }
+}
+
+void JT1078Session::bindSession(const std::string &sim, int channel) {
+    _context.sim = sim;
+    _context.channel = channel;
+
+    JT1078Task task;
+    if (JT1078TaskManager::Instance().findPendingTask(sim, channel, task)) {
+        _context.biz_type = task.biz_type;
+        _context.app = task.app;
+        _context.stream_id = task.stream_id;
+        _context.task_id = task.task_id;
+        _context.bound = true;
+        JT1078TaskManager::Instance().removePendingTask(sim, channel);
+
+        InfoP(this) << "JT1078 session bound pending task"
+                    << ", biz_type: " << JT1078TaskManager::bizTypeToString(_context.biz_type)
+                    << ", sim: " << sim
+                    << ", channel: " << channel
+                    << ", app: " << _context.app
+                    << ", stream_id: " << _context.stream_id
+                    << ", task_id: " << (_context.task_id.empty() ? "-" : _context.task_id);
+    } else {
+        _context.biz_type = JT1078BizType::Live;
+        _context.app = "live";
+        _context.stream_id = sim + "_" + std::to_string(channel) + "_live";
+        _context.task_id.clear();
+        _context.bound = true;
+
+        InfoP(this) << "JT1078 session bound default live"
+                    << ", sim: " << sim
+                    << ", channel: " << channel
+                    << ", app: " << _context.app
+                    << ", stream_id: " << _context.stream_id;
+    }
+
+    auto self = std::dynamic_pointer_cast<JT1078Session>(shared_from_this());
+    if (self) {
+        JT1078SessionManager::Instance().addSession(_context.app, _context.stream_id, _context.sim, _context.channel, self);
+        _context.registered = true;
     }
 }
 
@@ -202,9 +276,10 @@ void JT1078Session::logStep3Packet(const char *stage, const JT1078RtpPacket *pac
 
 void JT1078Session::logStep4Frame(const char *stage, const JT1078FrameAssembler::Result &result) {
     InfoP(this) << "JT1078 step4 " << stage
-                << ", stream_id: " << (_stream_id.empty() ? "-" : _stream_id)
-                << ", sim: " << (_sim.empty() ? "-" : _sim)
-                << ", channel: " << _channel
+                << ", app: " << (_context.app.empty() ? "-" : _context.app)
+                << ", stream_id: " << (_context.stream_id.empty() ? "-" : _context.stream_id)
+                << ", sim: " << (_context.sim.empty() ? "-" : _context.sim)
+                << ", channel: " << _context.channel
                 << ", seq: " << result.sequence
                 << ", timestamp: " << result.timestamp
                 << ", data_type: " << (int)result.data_type << "(" << JT1078RtpDecoder::dataTypeToString(result.data_type) << ")"
@@ -217,7 +292,8 @@ void JT1078Session::logStep4Frame(const char *stage, const JT1078FrameAssembler:
 
 void JT1078Session::logStep5Frame(const JT1078PsDemuxer::Frame &frame) {
     InfoP(this) << "JT1078 step5 frame"
-                << ", stream_id: " << (_stream_id.empty() ? "-" : _stream_id)
+                << ", app: " << (_context.app.empty() ? "-" : _context.app)
+                << ", stream_id: " << (_context.stream_id.empty() ? "-" : _context.stream_id)
                 << ", codec: " << getCodecName(frame.codec_id)
                 << ", stream: " << frame.stream
                 << ", flags: " << frame.flags

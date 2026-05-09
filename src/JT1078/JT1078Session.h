@@ -13,6 +13,7 @@
 
 #include "JT1078FrameAssembler.h"
 #include "JT1078PsDemuxer.h"
+#include "JT1078TaskManager.h"
 #include "Network/Session.h"
 #include "Network/Buffer.h"
 #include "Util/TimeTicker.h"
@@ -23,6 +24,17 @@ struct JT1078RtpPacket;
 class JT1078PacketSplitter;
 class JT1078StreamMuxer;
 
+struct JT1078SessionContext {
+    JT1078BizType biz_type = JT1078BizType::Live;
+    std::string sim;
+    int channel = 0;
+    std::string app;
+    std::string stream_id;
+    std::string task_id;
+    bool bound = false;
+    bool registered = false;
+};
+
 class JT1078Session : public toolkit::Session {
 public:
     using Ptr = std::shared_ptr<JT1078Session>;
@@ -32,11 +44,18 @@ public:
     void onRecv(const toolkit::Buffer::Ptr &buf) override;
     void onError(const toolkit::SockException &err) override;
     void onManager() override;
+    void closeByBiz(const std::string &reason);
+
+    const std::string &app() const;
+    const std::string &streamId() const;
+    const std::string &sim() const;
+    int channel() const;
 
 private:
     void onInputData(const char *data, size_t len);
     void onClose(const toolkit::SockException &err);
     void resetStreamContext();
+    void bindSession(const std::string &sim, int channel);
     void logStep2State(const char *stage, size_t incoming = 0);
     void onSplitterEvent(const char *stage, size_t consumed, const std::string &err);
     void onRtpPacket(const JT1078RtpPacket &packet, size_t consumed);
@@ -45,9 +64,7 @@ private:
     void logStep5Frame(const JT1078PsDemuxer::Frame &frame);
 
 private:
-    std::string _sim;
-    int _channel = 0;
-    std::string _stream_id;
+    JT1078SessionContext _context;
 
     uint64_t _total_bytes = 0;
     toolkit::Ticker _ticker;
